@@ -2,9 +2,9 @@
 
 This Node.js 22 entry reads `task.json` and every snapshot in `history.ndjson` from `MAKEFUN_INPUT_DIR` (default `/input`) and writes a deterministic `forecast.json` to `MAKEFUN_OUTPUT_DIR` (default `/output`). It uses only Node.js built-ins and does not access the network.
 
-For each game's observations at ranks 1–24, it sums Gaussian rank kernels for each scored place. Observation weights decay with a 21-hour half-life, and the final read receives a 1.5× boost. Games unseen for more than 12 hours receive an additional age decay. When creation details are available, games that age out of the chart during the task window are downweighted by the fraction of that window for which they remain eligible.
+The forecast is an equal blend of two estimates. The rank-kernel estimate uses top-25 observations with an 18-hour half-life, doubles the last read's observations, and decays games by the time since their last appearance. The Monte Carlo estimate uses recent log-rank observations to estimate global volatility and per-game drift, then simulates 800 deterministic 72-hour chart paths using Mulberry32 and Box–Muller Gaussian samples.
 
-Each place's game scores are normalized to 0.84, rounded to six decimal places, and capped at 100 rows. The remaining probability is intentionally unnamed. The ordered `top10` is selected by each game's probability-weighted expected place, with total probability mass and universe ID as tie-breakers. The task window and number of places are read from `task.json`.
+If `details.json` is present, both estimates account for games aging out 28 days after creation. Final probabilities are rounded to six decimals, values below 0.0005 are omitted, and each place has at most 100 named games; remaining probability stays unnamed. The top 10 is ordered by the sum of probability-weighted place values. Inputs and output paths are configurable with `MAKEFUN_INPUT_DIR` and `MAKEFUN_OUTPUT_DIR`.
 
 Run locally with:
 
