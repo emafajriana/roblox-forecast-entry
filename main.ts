@@ -43,7 +43,13 @@ const OUTPUT_DIR = process.env.MAKEFUN_OUTPUT_DIR ?? '/output';
 const PLACES = 10;
 const HOURS = 72;
 const SAMPLES = 800;
-const PROBABILITY_CUTOFF = 0.0005;
+// No minimum-probability cutoff: the scorer redistributes each place's
+// leftover mass (1 - sum) uniformly over games with NO emitted row, so
+// dropping tiny rows shrinks every unlisted game's fallback probability.
+// Keeping every positive row (validated on practice: -33.48 vs -34.39
+// with a 0.0005 cutoff) is worth ~0.9 log-score points. Rows are emitted
+// at full precision -- even ~1e-11 kernel-tail rows count as named, which
+// is what the validated Python reference does; at most 100 rows/place.
 const MAX_ROWS_PER_PLACE = 100;
 const ELIGIBILITY_MS = 28 * 24 * 60 * 60 * 1000;
 const HOUR_MS = 60 * 60 * 1000;
@@ -133,6 +139,13 @@ for (const observations of observationsByGame.values()) {
 const globalVolatility = median(volatilityMeasures);
 
 const kernelScores = new Map<number, number[]>();
+// Pre-damp raw kernel sums, for the reference's row-survival test: the
+// Python model keeps a game at a place only when its raw sum exceeds
+// 1e-9 (before staleness damping and normalisation). Games below that
+// are pure Gaussian tail (exp(-72)-scale) and must stay unnamed so they
+// collect the fallback share instead of a ~0 row that would floor them
+// at ln(0.0001) if they win the place.
+const kernelRawSums = new Map<number, number[]>();
 for (const [id, observations] of kernelObservations) {
   const scores = Array(PLACES).fill(0) as number[];
   for (const observation of observations) {
@@ -141,6 +154,7 @@ for (const [id, observations] of kernelObservations) {
       scores[place - 1]! += observation.weight * Math.exp(-(distance * distance) / (2 * 2.0 ** 2));
     }
   }
+  kernelRawSums.set(id, [...scores]);
 
   if (detailsAvailable) {
     const createdAt = creationByGame.get(id);
@@ -244,7 +258,17 @@ for (let sample = 0; sample < SAMPLES; sample++) {
     values.length = 0;
     const forecastTime = endTime + hour * HOUR_MS;
     const horizon = Math.min(hour, 48);
-    const standardDeviation = globalVolatility * 2.0 * Math.sqrt(horizon);
+    // Volatility scale 4.23: the runtime median GVOL on the practice
+    // history is ~0.0284, so 0.0284 * 4.23 ~= 0.12 -- the effective
+    // diffusion coefficient of the validated Python reference, whose
+    // GVOL read fell back to a constant 0.06 (0.06 * 2.0 = 0.12) because
+    // of a sign bug in its consecutive-pair differencing. The scale is
+    // kept relative to the runtime GVOL (recomputed from the scoring
+    // history) rather than hardcoding 0.12, so it adapts if the final
+    // history is more/less volatile. Practice: -33.12 at 4.23 vs -33.49
+    // at 2.0 (same rows); 4.0 and 5.0 score -33.34 / -33.36, so the
+    // neighbourhood is flat -- 4.23 is calibration, not overfitting.
+    const standardDeviation = globalVolatility * 4.23 * Math.sqrt(horizon);
 
     for (const candidate of candidates) {
       if (candidate.eligibleUntil !== null && forecastTime > candidate.eligibleUntil) continue;
@@ -273,12 +297,29 @@ for (const id of allIds) {
     const monteCarloProbability = monteCarloCounts
       ? (monteCarloCounts[place]! / (SAMPLES * HOURS)) * 0.84
       : 0;
-    const probability = 0.5 * kernelProbability + 0.5 * monteCarloProbability;
-    if (probability < PROBABILITY_CUTOFF) continue;
+    // Drop MC dust BEFORE blending, exactly like the Python reference
+    // (mc_forecast keeps only c/total*named_mass >= 0.0005): an MC row
+    // of 1-2 counts out of 57,600 blends to p ~0.00002, and emitting it
+    // would replace that game's fallback share (~0.005) with dust --
+    // worth ~4 log points whenever such a newcomer actually wins a
+    // place. Kernel tail rows are NOT cut: the reference keeps them all,
+    // and keeping them raises the fallback for every other unlisted game.
+    const monteCarloKept = monteCarloProbability >= 0.0005 ? monteCarloProbability : 0;
+    const probability = 0.5 * kernelProbability + 0.5 * monteCarloKept;
+    // Row survives iff the reference would keep it: kernel raw sum above
+    // 1e-9, or a kept MC row. (A game with neither stays unnamed and
+    // collects the fallback share -- see the MC-dust note above.)
+    const kernelRaw = kernelRawSums.get(id)?.[place] ?? 0;
+    if (probability <= 0 || (kernelRaw <= 1e-9 && monteCarloKept === 0)) continue;
+    // Emit the row at FULL precision, however small: the reference keeps
+    // kernel-tail rows down to ~1e-11, and rounding to 6 decimals (or any
+    // cutoff) drops them -- each dropped row rejoins the unnamed pool and
+    // lowers the fallback share every other unlisted game receives.
+    // Validated: rounding to 6dp costs ~0.65 points on practice.
     probabilitiesByPlace[place]!.push({
       universe_id: id,
       place: place + 1,
-      p: Number(probability.toFixed(6)),
+      p: probability,
     });
   }
 }
@@ -296,11 +337,21 @@ for (const placeRows of probabilitiesByPlace) {
 }
 
 const weightedPlaceSum = new Map<number, number>();
+const totalMass = new Map<number, number>();
 for (const row of probabilities) {
   weightedPlaceSum.set(row.universe_id, (weightedPlaceSum.get(row.universe_id) ?? 0) + row.place * row.p);
+  totalMass.set(row.universe_id, (totalMass.get(row.universe_id) ?? 0) + row.p);
 }
+// Rank by NORMALISED expected place (sum k*p_k / sum p_k): the raw sum
+// favours dust games that merely hold a tiny row at every place. (top10
+// only breaks exact log-score ties, but the guess should still be honest.)
 const top10 = [...weightedPlaceSum.keys()]
-  .sort((a, b) => weightedPlaceSum.get(a)! - weightedPlaceSum.get(b)! || a - b)
+  .sort(
+    (a, b) =>
+      weightedPlaceSum.get(a)! / totalMass.get(a)! - weightedPlaceSum.get(b)! / totalMass.get(b)! ||
+      totalMass.get(b)! - totalMass.get(a)! ||
+      a - b,
+  )
   .slice(0, PLACES);
 
 if (top10.length !== PLACES) {
